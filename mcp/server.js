@@ -11,48 +11,43 @@ async function query(text, params = []) {
   if (!pool) throw new Error('database_not_configured');
   return pool.query(text, params);
 }
+const n=v=>v==null?null:Number(v);
 
-app.get('/', (_req,res) => res.type('html').send(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>GoldTrap MCP</title><style>body{margin:0;background:#090c11;color:#eef2f6;font-family:system-ui,-apple-system,sans-serif}.w{max-width:760px;margin:12vh auto;padding:24px}.card{background:#111720;border:1px solid #26303b;border-radius:18px;padding:28px}b{color:#d9b55b}p{color:#91a0b2;line-height:1.6}.ok{color:#63d69b;font-weight:700}.tag{display:inline-block;border:1px solid #33404e;border-radius:99px;padding:7px 10px;font-size:12px;color:#aab7c6}</style></head><body><div class="w"><div class="card"><div class="tag">READ-ONLY</div><h1><b>GoldTrap</b> MCP</h1><p class="ok">SERVICE ONLINE</p><p>Analytics gateway for GoldTrap vNext telemetry. Trading execution remains exclusively inside MetaTrader 5.</p><p>Health: <code>/health</code><br>Tool catalog: <code>/tools</code><br>MCP gateway: <code>POST /mcp</code></p></div></div></body></html>`));
+async function snapshot(hours=24){
+  hours=Math.min(Math.max(Number(hours)||24,1),2160);
+  const [agg,last,events,versions,depths] = await Promise.all([
+    query(`SELECT count(*)::int events,avg(spread_points)::float avg_spread_points,min(spread_points)::float min_spread_points,max(spread_points)::float max_spread_points,min(basket_pl)::float min_basket_pl,max(basket_pl)::float max_basket_pl,avg(basket_pl)::float avg_observed_basket_pl,max(positions)::int max_grid_depth,count(*) FILTER (WHERE event='GRID_FILLED')::int grid_fills,count(*) FILTER (WHERE event LIKE 'TP_%')::int tp_events,count(*) FILTER (WHERE event IN ('TP_HIT','BASKET_CLOSED','LEGACY_BASKET_CLOSE'))::int close_events,count(DISTINCT strategy_version)::int strategy_versions FROM telemetry_events WHERE received_at > now()-($1||' hours')::interval`,[hours]),
+    query(`SELECT id,received_at,event_time,strategy_version,event,symbol,side,positions,volume::float,bid::float,ask::float,spread_points::float,basket_pl::float,weighted_be::float,requested_tp::float,last_entry::float,note FROM telemetry_events ORDER BY received_at DESC LIMIT 1`),
+    query(`SELECT id,received_at,event_time,strategy_version,event,symbol,side,positions,volume::float,bid::float,ask::float,spread_points::float,basket_pl::float,weighted_be::float,requested_tp::float,last_entry::float,note FROM telemetry_events WHERE received_at > now()-($1||' hours')::interval ORDER BY received_at DESC LIMIT 100`,[hours]),
+    query(`SELECT coalesce(strategy_version,'unknown') strategy_version,count(*)::int events,avg(spread_points)::float avg_spread_points,min(basket_pl)::float min_basket_pl,max(basket_pl)::float max_basket_pl,max(positions)::int max_grid_depth,count(*) FILTER (WHERE event='GRID_FILLED')::int grid_fills,count(*) FILTER (WHERE event LIKE 'TP_%')::int tp_events FROM telemetry_events WHERE received_at > now()-($1||' hours')::interval GROUP BY strategy_version ORDER BY max(received_at) DESC`,[hours]),
+    query(`SELECT coalesce(positions,0)::int depth,count(*)::int observations,avg(basket_pl)::float avg_basket_pl,min(basket_pl)::float worst_basket_pl,max(basket_pl)::float best_basket_pl FROM telemetry_events WHERE received_at > now()-($1||' hours')::interval GROUP BY positions ORDER BY positions`,[hours])
+  ]);
+  const a=agg.rows[0];
+  return {hours,generated_at:new Date().toISOString(),authority:'read-only',feed:{connected:!!last.rows[0],last_event:last.rows[0]||null},metrics:a,recent_events:events.rows,versions:versions.rows,grid_depth:depths.rows};
+}
 
-app.get('/health', async (_req, res) => {
-  try { await query('select 1'); res.json({ service: 'goldtrap-mcp', status: 'ok', database: 'ok', authority: 'read-only' }); }
-  catch (e) { res.status(503).json({ service: 'goldtrap-mcp', status: 'degraded', database: 'error', error: e.message, authority: 'read-only' }); }
-});
+function analysis(s){
+ const m=s.metrics||{}; const notes=[]; const risks=[];
+ if(!s.feed.connected) notes.push('Waiting for MT5 telemetry. Analytics will populate after the EA sends its first event.');
+ else {
+  notes.push(`Observed ${m.events||0} telemetry events in the last ${s.hours} hours.`);
+  if(n(m.avg_spread_points)!=null) notes.push(`Average observed spread is ${n(m.avg_spread_points).toFixed(1)} points.`);
+  if((m.grid_fills||0)>0) notes.push(`${m.grid_fills} recovery-grid fills were observed; maximum recorded basket depth is ${m.max_grid_depth||0}.`);
+  if((m.tp_events||0)>0) notes.push(`${m.tp_events} TP lifecycle events were recorded.`);
+  if(n(m.min_basket_pl)!=null && n(m.min_basket_pl)<0) risks.push(`Worst observed basket P/L snapshot is ${n(m.min_basket_pl).toFixed(2)} account-currency units.`);
+  if(n(m.max_spread_points)!=null && n(m.avg_spread_points)!=null && n(m.max_spread_points)>n(m.avg_spread_points)*2) risks.push('Spread spikes materially above the observed average occurred in this window.');
+ }
+ return {summary:notes,risks,interpretation:'Descriptive telemetry only. Strategy changes should be validated on demo/backtest before any live deployment.'};
+}
 
-app.get('/tools', (_req,res) => res.json({
-  authority:'read-only',
-  tools:[
-    {name:'goldtrap_status',description:'Current telemetry feed status'},
-    {name:'goldtrap_recent_events',description:'Recent GoldTrap telemetry events'},
-    {name:'goldtrap_summary',description:'Aggregate telemetry metrics over a time window'},
-    {name:'goldtrap_grid_cycles',description:'Recent grid and take-profit lifecycle events'}
-  ]
-}));
+const dashboard=`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>GoldTrap MCP Analytics</title><style>*{box-sizing:border-box}body{margin:0;background:#080b10;color:#edf2f7;font-family:Inter,system-ui,-apple-system,sans-serif}.w{max-width:1180px;margin:auto;padding:28px 18px}.top{display:flex;justify-content:space-between;align-items:center;gap:12px}.brand{font-size:22px;font-weight:850}.brand b{color:#d9b55b}.tag{border:1px solid #2c3744;border-radius:99px;padding:7px 10px;color:#9cabbc;font-size:11px}.hero,.card{background:#10161e;border:1px solid #202b37;border-radius:17px}.hero{padding:24px;margin:22px 0 13px}.hero h1{margin:6px 0;font-size:30px}.muted{color:#8292a5}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:11px}.card{padding:17px}.lab{font-size:10px;letter-spacing:.12em;text-transform:uppercase;color:#6f8195}.val{font-size:24px;font-weight:780;margin-top:7px}.green{color:#63d69b}.amber{color:#d9b55b}.section{margin-top:12px}.section h3{margin:0 0 13px}.two{display:grid;grid-template-columns:1fr 1fr;gap:12px}.event{display:grid;grid-template-columns:130px 110px 70px 1fr;gap:10px;padding:10px 0;border-bottom:1px solid #1d2732;font-size:12px}.note{padding:9px 0;border-bottom:1px solid #1d2732;color:#aab6c5;line-height:1.45}.risk{color:#e0b16e}.empty{color:#657589;padding:16px 0}.foot{font-size:11px;color:#526171;margin:22px 0}@media(max-width:760px){.grid{grid-template-columns:1fr 1fr}.two{grid-template-columns:1fr}.event{grid-template-columns:95px 90px 55px 1fr}.hero h1{font-size:25px}}</style></head><body><div class="w"><div class="top"><div class="brand"><b>GOLDTRAP</b> MCP</div><div class="tag">READ-ONLY ANALYTICS</div></div><div class="hero"><div class="lab">Telemetry Intelligence</div><h1>GoldTrap Trading Observatory</h1><div class="muted">Live telemetry, basket behavior, grid depth and strategy-version analysis from MT5.</div></div><div class="grid"><div class="card"><div class="lab">MT5 Feed</div><div id="feed" class="val amber">WAITING</div></div><div class="card"><div class="lab">Events 24H</div><div id="events" class="val">0</div></div><div class="card"><div class="lab">Avg Spread</div><div id="spread" class="val">—</div></div><div class="card"><div class="lab">Max Grid Depth</div><div id="depth" class="val">—</div></div></div><div class="two section"><div class="card"><h3>Current / Last Telemetry</h3><div id="last" class="empty">Waiting for MT5...</div></div><div class="card"><h3>AI-ready Analysis</h3><div id="analysis" class="empty">Waiting for telemetry...</div></div></div><div class="card section"><h3>Recent Events</h3><div id="recent" class="empty">No events yet.</div></div><div class="card section"><h3>Strategy Versions</h3><div id="versions" class="empty">No version data yet.</div></div><div class="foot">GoldTrap MCP · descriptive research telemetry · execution authority remains in MetaTrader 5</div></div><script>const f=(v,d=2)=>v==null?'—':Number(v).toFixed(d);async function go(){try{let s=await fetch('/api/dashboard?hours=24').then(r=>r.json());let a=await fetch('/api/analysis?hours=24').then(r=>r.json());feed.textContent=s.feed.connected?'CONNECTED':'WAITING';feed.className='val '+(s.feed.connected?'green':'amber');events.textContent=s.metrics.events||0;spread.textContent=f(s.metrics.avg_spread_points,1);depth.textContent=s.metrics.max_grid_depth??'—';let x=s.feed.last_event;last.innerHTML=x?'<div class="note"><b>'+x.event+'</b> · '+(x.symbol||'')+' · '+(x.side||'')+'</div><div class="note">Positions: '+(x.positions??'—')+' · Volume: '+(x.volume??'—')+' · Basket P/L: '+f(x.basket_pl)+'</div><div class="note">BE: '+f(x.weighted_be,3)+' · TP: '+f(x.requested_tp,3)+' · Spread: '+f(x.spread_points,1)+'</div>':'Waiting for MT5 telemetry...';analysis.innerHTML=[...(a.summary||[]).map(v=>'<div class="note">'+v+'</div>'),...(a.risks||[]).map(v=>'<div class="note risk">'+v+'</div>')].join('')||'Waiting for telemetry...';recent.innerHTML=(s.recent_events||[]).slice(0,20).map(e=>'<div class="event"><span>'+new Date(e.received_at).toLocaleTimeString()+'</span><b>'+e.event+'</b><span>'+(e.positions??'—')+' grid</span><span>P/L '+f(e.basket_pl)+' · spread '+f(e.spread_points,1)+'</span></div>').join('')||'No events yet.';versions.innerHTML=(s.versions||[]).map(v=>'<div class="note"><b>'+v.strategy_version+'</b> · '+v.events+' events · avg spread '+f(v.avg_spread_points,1)+' · max grid '+(v.max_grid_depth??'—')+' · TP events '+v.tp_events+'</div>').join('')||'No version data yet.'}catch(e){feed.textContent='ERROR'}}go();setInterval(go,10000)</script></body></html>`;
 
-app.post('/mcp', async (req,res) => {
-  try {
-    const { tool, arguments: args = {} } = req.body || {};
-    if (tool === 'goldtrap_status') {
-      const r = await query(`SELECT count(*)::int events,max(received_at) last_event FROM telemetry_events`);
-      return res.json({ tool, result: { ...r.rows[0], execution: 'read-only' } });
-    }
-    if (tool === 'goldtrap_recent_events') {
-      const limit = Math.min(Math.max(Number(args.limit)||50,1),200);
-      const r = await query(`SELECT id,received_at,event_time,strategy_version,event,symbol,side,positions,volume,bid,ask,spread_points,basket_pl,weighted_be,requested_tp,last_entry,note FROM telemetry_events ORDER BY received_at DESC LIMIT $1`,[limit]);
-      return res.json({ tool, result: r.rows });
-    }
-    if (tool === 'goldtrap_summary') {
-      const hours = Math.min(Math.max(Number(args.hours)||24,1),2160);
-      const r = await query(`SELECT count(*)::int events,avg(spread_points) avg_spread_points,min(basket_pl) min_basket_pl,max(basket_pl) max_basket_pl,count(*) FILTER (WHERE event='GRID_FILLED')::int grid_fills,count(*) FILTER (WHERE event LIKE 'TP_%')::int tp_events FROM telemetry_events WHERE received_at > now()-($1||' hours')::interval`,[hours]);
-      return res.json({ tool, result: { hours, ...r.rows[0] } });
-    }
-    if (tool === 'goldtrap_grid_cycles') {
-      const limit = Math.min(Math.max(Number(args.limit)||100,1),500);
-      const r = await query(`SELECT id,received_at,event,side,positions,volume,basket_pl,weighted_be,requested_tp,last_entry,note FROM telemetry_events WHERE event IN ('ENTRY','GRID_FILLED','TP_SET','TP_MOVED','TP_HIT','BASKET_CLOSED') OR event LIKE 'TP_%' ORDER BY received_at DESC LIMIT $1`,[limit]);
-      return res.json({ tool, result: r.rows });
-    }
-    return res.status(400).json({ error:'unknown_tool' });
-  } catch (e) { return res.status(500).json({ error:e.message }); }
-});
+app.get('/',(_req,res)=>res.type('html').send(dashboard));
+app.get('/health',async(_req,res)=>{try{await query('select 1');res.json({service:'goldtrap-mcp',version:'0.3.0',status:'ok',database:'ok',authority:'read-only'});}catch(e){res.status(503).json({service:'goldtrap-mcp',version:'0.3.0',status:'degraded',database:'error',error:e.message,authority:'read-only'});}});
+app.get('/api/dashboard',async(req,res)=>{try{res.json(await snapshot(req.query.hours));}catch(e){res.status(500).json({error:e.message});}});
+app.get('/api/analysis',async(req,res)=>{try{const s=await snapshot(req.query.hours);res.json({hours:s.hours,generated_at:s.generated_at,...analysis(s),metrics:s.metrics});}catch(e){res.status(500).json({error:e.message});}});
+app.get('/tools',(_req,res)=>res.json({authority:'read-only',version:'0.3.0',tools:[{name:'goldtrap_status',description:'Feed health and latest MT5 event'},{name:'goldtrap_recent_events',description:'Recent telemetry with basket, TP, BE and spread context'},{name:'goldtrap_summary',description:'Aggregate performance/risk observations over a time window'},{name:'goldtrap_grid_cycles',description:'Grid and take-profit lifecycle events'},{name:'goldtrap_strategy_versions',description:'Compare observed metrics by EA strategy version'},{name:'goldtrap_grid_depth',description:'Distribution of observed basket/grid depth'},{name:'goldtrap_analysis',description:'Descriptive analysis of spread, basket P/L and recovery behavior'}]}));
 
-app.listen(PORT,'0.0.0.0',()=>console.log(`GoldTrap MCP listening on ${PORT}`));
+app.post('/mcp',async(req,res)=>{try{const{tool,arguments:args={}}=req.body||{};const hours=Math.min(Math.max(Number(args.hours)||24,1),2160);if(tool==='goldtrap_status'){const s=await snapshot(hours);return res.json({tool,result:{feed:s.feed,metrics:s.metrics,execution:'read-only'}});}if(tool==='goldtrap_recent_events'){const limit=Math.min(Math.max(Number(args.limit)||50,1),500);const r=await query(`SELECT id,received_at,event_time,strategy_version,event,symbol,side,positions,volume::float,bid::float,ask::float,spread_points::float,basket_pl::float,weighted_be::float,requested_tp::float,last_entry::float,note FROM telemetry_events ORDER BY received_at DESC LIMIT $1`,[limit]);return res.json({tool,result:r.rows});}if(tool==='goldtrap_summary'){const s=await snapshot(hours);return res.json({tool,result:{hours,metrics:s.metrics,analysis:analysis(s)}});}if(tool==='goldtrap_grid_cycles'){const limit=Math.min(Math.max(Number(args.limit)||100,1),500);const r=await query(`SELECT id,received_at,strategy_version,event,side,positions,volume::float,basket_pl::float,spread_points::float,weighted_be::float,requested_tp::float,last_entry::float,note FROM telemetry_events WHERE event IN ('ENTRY','GRID_FILLED','TP_SET','TP_MOVED','TP_HIT','BASKET_CLOSED','LEGACY_BASKET_CLOSE') OR event LIKE 'TP_%' ORDER BY received_at DESC LIMIT $1`,[limit]);return res.json({tool,result:r.rows});}if(tool==='goldtrap_strategy_versions'){const s=await snapshot(hours);return res.json({tool,result:s.versions});}if(tool==='goldtrap_grid_depth'){const s=await snapshot(hours);return res.json({tool,result:s.grid_depth});}if(tool==='goldtrap_analysis'){const s=await snapshot(hours);return res.json({tool,result:{...analysis(s),metrics:s.metrics,versions:s.versions,grid_depth:s.grid_depth}});}return res.status(400).json({error:'unknown_tool'});}catch(e){return res.status(500).json({error:e.message});}});
+
+app.listen(PORT,'0.0.0.0',()=>console.log(`GoldTrap MCP v0.3 listening on ${PORT}`));
