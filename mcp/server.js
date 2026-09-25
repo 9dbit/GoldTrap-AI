@@ -12,6 +12,8 @@ async function query(text, params = []) {
   return pool.query(text, params);
 }
 
+app.get('/', (_req,res) => res.type('html').send(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>GoldTrap MCP</title><style>body{margin:0;background:#090c11;color:#eef2f6;font-family:system-ui,-apple-system,sans-serif}.w{max-width:760px;margin:12vh auto;padding:24px}.card{background:#111720;border:1px solid #26303b;border-radius:18px;padding:28px}b{color:#d9b55b}p{color:#91a0b2;line-height:1.6}.ok{color:#63d69b;font-weight:700}.tag{display:inline-block;border:1px solid #33404e;border-radius:99px;padding:7px 10px;font-size:12px;color:#aab7c6}</style></head><body><div class="w"><div class="card"><div class="tag">READ-ONLY</div><h1><b>GoldTrap</b> MCP</h1><p class="ok">SERVICE ONLINE</p><p>Analytics gateway for GoldTrap vNext telemetry. Trading execution remains exclusively inside MetaTrader 5.</p><p>Health: <code>/health</code><br>Tool catalog: <code>/tools</code><br>MCP gateway: <code>POST /mcp</code></p></div></div></body></html>`));
+
 app.get('/health', async (_req, res) => {
   try { await query('select 1'); res.json({ service: 'goldtrap-mcp', status: 'ok', database: 'ok', authority: 'read-only' }); }
   catch (e) { res.status(503).json({ service: 'goldtrap-mcp', status: 'degraded', database: 'error', error: e.message, authority: 'read-only' }); }
